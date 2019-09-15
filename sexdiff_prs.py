@@ -21,6 +21,8 @@ import numpy as np
 from hail.utils.java import Env
 import requests
 import subprocess
+import os
+import pandas as pd
 url = 'https://raw.githubusercontent.com/nikbaya/split/master/gwas.py'
 r = requests.get(url).text
 exec(r)
@@ -104,7 +106,8 @@ def gwas(mt, x, y, cov_list=[], with_intercept=True, pass_through=[], path_to_sa
                            entry_exprs={'__x':x})
     
     print('... Calculating allele frequency ...')
-    mt_freq = mt.annotate_rows(freq = hl.agg.mean(mt.dosage)/2) #frequency of alternate allele
+    mt_freq_rows = mt.annotate_rows(freq = hl.agg.mean(mt.dosage)/2).rows() #frequency of alternate allele
+    mt_freq_rows = mt_freq_rows.key_by('rsid')
     
     if normalize_x:
         mt = mt.annotate_rows(__gt_stats = hl.agg.stats(mt.__x))
@@ -136,7 +139,7 @@ def gwas(mt, x, y, cov_list=[], with_intercept=True, pass_through=[], path_to_sa
         
     ss = ss_template.annotate(chr = gwas_ht[ss_template.SNP].locus.contig,
                               bpos = gwas_ht[ss_template.SNP].locus.position,
-                              freq = mt_freq.rows()[ss_template.SNP].freq,
+                              freq = mt_freq_rows[ss_template.SNP].freq,
                               beta = gwas_ht[ss_template.SNP].beta,
                               z = gwas_ht[ss_template.SNP].t_stat,
                               pval = gwas_ht[ss_template.SNP].p_value,
@@ -157,7 +160,8 @@ def gwas(mt, x, y, cov_list=[], with_intercept=True, pass_through=[], path_to_sa
 def get_freq(mt, sex, n_remove, seed):
     r'''
     Get allele frequencies and other SNP information (needed to fix previously 
-    created sumstats files)'''
+    created sumstats files)
+    '''
     
     print('... Calculating allele frequency ...')
     mt = mt.annotate_rows(freq = hl.agg.mean(mt.dosage)/2) #frequency of alternate allele
@@ -165,6 +169,7 @@ def get_freq(mt, sex, n_remove, seed):
     mt_rows = mt_rows.key_by('rsid')
     mt_rows = mt_rows.annotate(chr = mt_rows.locus.contig,
                                bpos = mt_rows.locus.position)
+
     
     ss = hl.import_table(wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.old.tsv.bgz',
                          impute=True,
@@ -174,9 +179,10 @@ def get_freq(mt, sex, n_remove, seed):
                      bpos = mt_rows[ss.SNP].bpos,
                      freq = mt_rows[ss.SNP].freq,
                      z = ((-1)*(ss.beta<0)*hl.abs(hl.qnorm(ss.p_value/2))+
-                          (ss.beta<0)*hl.abs(hl.qnorm(ss.p_value/2)))
+                          (ss.beta>0)*hl.abs(hl.qnorm(ss.p_value/2)))
                      )
-    
+                     
+
     if 'N' in ss.row:
         if 'n' not in ss.row:
             ss = ss.annotate(n = ss.N)
@@ -192,19 +198,101 @@ def get_freq(mt, sex, n_remove, seed):
     ss = ss.key_by('snpid')
     
     ss.export(wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.tsv.bgz')
+    
+def get_freq_alt(mt, sex, n_remove, seed):
+    
+    ss = hl.import_table(wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.tsv.bgz',
+                         impute=True,
+                         key='snpid')
+    ss = ss.annotate(z = ((-1)*(ss.beta<0)*hl.abs(hl.qnorm(ss.pval/2))+
+                          (ss.beta>0)*hl.abs(hl.qnorm(ss.pval/2)))
+                     )
+    
+    if 'N' in ss.row:
+        if 'n' not in ss.row:
+            ss = ss.annotate(n = ss.N)
+        ss = ss.drop('N')
+    
+    ss = ss.key_by()
+    ss = ss.select('snpid','chr','bpos','a1','a2','freq','beta','z','pval','n')
+    ss = ss.key_by('snpid')
+    
+    ss.export(wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.tsv.bgz')
         
+def prs(mt, phen, sex, n_remove, prune, threshold, seed):
+    r'''
+    Calculate PRS using betas from both sexes and sex-stratified GWAS, as well
+    as MTAG meta-analyzed betas.
+    '''
+    assert sex in ['both_sexes','female','male'], f'WARNING: sex={sex} not allowed. sex must be one of the following: both_sexes, female, male'
+    threshold_str = '{:.4e}'.format(threshold)
+    corr_path = (wd+f'corr.{phen}.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.\
+                 {"" if prune else "not_"}pruned.threshold_{threshold_str}.tsv')
+    try:
+        subprocess.check_output([f'gsutil', 'ls', corr_path]) != None
+    except:
+        if prune:
+            print('\n... Pruning SNPs ...')
+            # define the set of SNPs
+            pruned_snps_file = 'gs://nbaya/risk_gradients/ukb_imp_v3_pruned.bim' #from Robert Maier (pruning threshold=0.2, random 10k sample)
+            variants = hl.import_table(pruned_snps_file, delimiter='\t', no_header=True, impute=True)
+            print(f'\n... Pruning to variants in {pruned_snps_file}...')
+            variants = variants.rename(
+                {'f0': 'chr', 'f1': 'rsid', 'f3': 'pos'}).key_by('rsid')
+            mt = mt.key_rows_by('rsid')
+            # filter to variants defined in variants table
+            mt = mt.filter_rows(hl.is_defined(variants[mt.rsid]))
+            ct_rows = mt.count_rows()
+            print(f'\n... row count after pruning filter: {ct_rows} ...\n')
+        else:
+            print(f'\n... Not pruning because prune={prune} ...\n')
+            
+        # "def" uses the MTAG results created by using the default settings
+        # "rg1" uses the MTAG results created by using the --perfect-gencov flag
+        gwas_versions = ['unadjusted',f'mtag_{"rg1" if sex is "both_sexes" else "def"}'] 
+        
+        r_ls, gwas_version_ls = [], []
+        
+        for gwas_version in gwas_versions:
+            print(f'\n... Calculating PRS-phenotype R for "{phen_dict[phen][0]}" {sex} {gwas_version} ...')
+            gwas_version_suffix = "" if gwas_version=='unadjusted' else '.'+gwas_version
+            gwas_path = (wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}{gwas_version_suffix}.tsv.bgz')
     
+            ss=hl.import_table(gwas_path,impute=True,key='snpid' if gwas_version is 'unadjusted' else 'SNP')
+            
+            ss = ss.filter(ss.pval<threshold)
+            
+            mt = mt.annotate(beta = ss[mt.rsid]['beta' if gwas_version is 'unadjusted' else 'mtag_beta'])
+            
+            mt = mt.aggregate_cols(prs = hl.agg.sum(mt.dosage*mt.beta))
+            
+            mt_cols = mt.cols()
+            
+            r = mt_cols.aggregate(hl.agg.corr(mt_cols.phen, mt_cols.prs))
+            print(f'\n\n... PRS-phenotype R for "{phen_dict[phen][0]}" {sex} {gwas_version}\
+                                                  GWAS ({"" if prune else "not_"}pruned,\
+                                                  pval<{threshold_str}) ...\nR = {r}\
+                                                  \nR^2 = {r**2}\n\n')
+            r_ls.append(r)
+            gwas_version_ls.append(gwas_version)
+            
+        df = pd.DataFrame(data=list(zip([phen]*len(r_ls), [sex]*len(r_ls), gwas_version_ls, r_ls)),
+                              columns=['phen', 'sex', 'gwas_version', 'r'])
+        print(df)
     
+        hl.Table.from_pandas(df).export(corr_path)
+
+
 
 if __name__ == "__main__":
     phen_dict = {
-            '50_irnt':['Standing height', 73178],
-            '23105_irnt':['Basal metabolic rate', 35705],
-            '23106_irnt':['Impedance of the whole body', 73701],
-            '2217_irnt':['Age started wearing contact lenses or glasses', 73178],
-#            '23127_irnt':['Trunk fat percentage', 73178],
-            '1100':['Drive faster than motorway speed limit', 73178],
-            '1757':['Facial ageing', 35705],
+                '50_irnt':['Standing height', 73178],
+                '23105_irnt':['Basal metabolic rate', 35705],
+#                '23106_irnt':['Impedance of the whole body', 73701],
+#                '2217_irnt':['Age started wearing contact lenses or glasses', 73178],
+            '23127_irnt':['Trunk fat percentage', 73178]
+#                '1100':['Drive faster than motorway speed limit', 73178],
+#                '1757':['Facial ageing', 35705],
 #            '6159_3':['Pain type(s) experienced in last month: Neck or shoulder',None],
 #            '894':['Duration of moderate activity',None],
 #            '1598':['Average weekly spirits intake',None]
@@ -217,25 +305,23 @@ if __name__ == "__main__":
         mt = get_mt(phen)
         mt_both, mt_f, mt_m, seed = remove_n_individuals(mt=mt, n_remove_per_sex=n_remove_per_sex, 
                                                          phen=phen,sexes = 'fm', seed=phen_dict[phen][1])
-        for mt_tmp, sex in [(mt_both,'both_sexes'), (mt_f,'female'), (mt_m,'male')]:            
-            print(f'\n... Running {sex} GWAS on "{phen_dict[phen][0]}" (code: {phen}) ...')
+        for mt_tmp, sex in [(mt_f,'female'), (mt_m,'male'), (mt_both,'both_sexes')]:            
             path = wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.tsv.bgz'
             try:
                 subprocess.check_output([f'gsutil', 'ls', path]) != None
-                print(
-                    f'\n#############\n{sex} "{phen_dict[phen][0]} GWAS already complete!\n#############')
+                print(f'\n... "{phen_dict[phen][0]}" GWAS of {sex} already complete! ...\n')
+                prs(mt=mt_tmp,phen=phen,sex=sex,n_remove=n_remove_per_sex,prune=True,threshold=1,seed=seed)
             except:
                 old_path = wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.old.tsv.bgz'
                 try:
                     subprocess.check_output([f'gsutil', 'ls', old_path]) != None
-                    print(
-                        f'\n#############\n{sex} "{phen_dict[phen][0]} GWAS already complete but needs more fields!\n#############')
-                    print(f'\n... Getting allele freq for {sex} GWAS on "{phen_dict[phen][0]}" (code: {phen}) ...')
+                    print(f'\n... "{phen_dict[phen][0]}" GWAS of {sex} already complete but needs more fields! ...\n')
                     get_freq(mt=mt_tmp, sex=sex, n_remove=n_remove_per_sex, seed=seed)
                 except:
+                    print(f'\n... Running {sex} GWAS on "{phen_dict[phen][0]}" (code: {phen}) ...\n')
                     gwas(mt=mt_tmp, 
                          x=mt_tmp.dosage, 
                          y=mt_tmp['phen'], 
                          path_to_save=path,
                          is_std_cov_list=True)
-            
+#            
