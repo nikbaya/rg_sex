@@ -19,24 +19,23 @@ For a given phenotype:
 import hail as hl
 import numpy as np
 from hail.utils.java import Env
-import requests
 import subprocess
-import os
 import pandas as pd
-url = 'https://raw.githubusercontent.com/nikbaya/split/master/gwas.py'
-r = requests.get(url).text
-exec(r)
-gwas=gwas
+from scipy import stats
+from datetime import datetime as dt
+#import requests
+#url = 'https://raw.githubusercontent.com/nikbaya/split/master/gwas.py'
+#r = requests.get(url).text
+#exec(r)
+#gwas=gwas
+hl.init(log='/tmp/hail.log')
 
 
 wd= 'gs://nbaya/sexdiff/prs/'
 
-def get_mt(phen, variant_set='hm3'):
-    mt0 = hl.read_matrix_table(f'gs://nbaya/split/ukb31063.{variant_set}_variants.gwas_samples_repart.mt')
-    
+def get_mt(mt0, phen_tb0, phen):
     print(f'\n... Reading UKB phenotype "{phen_dict[phen][0]}" (code: {phen}) ...')
-    phen_tb0 = hl.import_table('gs://ukb31063/ukb31063.PHESANT_January_2019.both_sexes.tsv.bgz',
-                               missing='',impute=True,types={'s': hl.tstr}, key='s')
+
     phen_tb = phen_tb0.select(phen).rename({phen:'phen'})
 
     mt1 = mt0.annotate_cols(phen_str = hl.str(phen_tb[mt0.s]['phen']).replace('\"',''))
@@ -46,12 +45,6 @@ def get_mt(phen, variant_set='hm3'):
         mt1 = mt1.annotate_cols(phen = hl.bool(mt1.phen_str)).drop('phen_str')
     else:
         mt1 = mt1.annotate_cols(phen = hl.float64(mt1.phen_str)).drop('phen_str')
-
-    #Remove withdrawn samples
-    withdrawn = hl.import_table('gs://nbaya/w31063_20181016.csv',missing='',no_header=True)
-    withdrawn_set = set(withdrawn.f0.take(withdrawn.count()))
-    mt1 = mt1.filter_cols(hl.literal(withdrawn_set).contains(mt1['s']),keep=False)
-    mt1 = mt1.key_cols_by('s')
     
     return mt1
 
@@ -59,6 +52,7 @@ def remove_n_individuals(mt, n_remove_per_sex, phen, sexes = 'fm', seed=None):
     r'''
     Removes n_remove_per_sex individuals from each specified sex (default is to remove from both
     females and males, i.e. sexes='fm').
+    Saves tables with phenotype data for each sex and the sexes combined.
     '''
     assert 'f' in sexes or 'm' in sexes, "sexes must have 'f' or 'm'"
     n_remove_per_sex = int(n_remove_per_sex)
@@ -70,32 +64,55 @@ def remove_n_individuals(mt, n_remove_per_sex, phen, sexes = 'fm', seed=None):
     print(f'\n\n... Initial combined mt count ({phen}): {initial_ct} ...\n')
     tb_sex_ls = [None, None]
     for idx, sex in enumerate(sexes):
-        filter_arg = mt_cols.isFemale if sex=='f' else (~mt_cols.isFemale if sex=='m' else None)
-        mt_cols_sex = mt_cols.filter(filter_arg) 
-        mt_cols_sex_ct = mt_cols_sex.count()
-        print(f'\n\n... Initial {sex} mt count ({phen}): {mt_cols_sex_ct} ...\n')
-        n_sex = mt_cols_sex.count()
-        tb1 = mt_cols_sex.add_index('idx_tmp')
-        tb2 = tb1.key_by('idx_tmp')
-        remove = [1]*(n_remove_per_sex)+[0]*(n_sex-n_remove_per_sex)
-        randstate = np.random.RandomState(int(seed)) 
-        randstate.shuffle(remove)
-        tb3 = tb2.annotate(remove = hl.literal(remove)[hl.int32(tb2.idx_tmp)])
-        tb4 = tb3.filter(tb3.remove == 1, keep=True) #remove samples we wish to discard from original mt
-        tb5 = tb4.key_by('s')
-        tb_sex_ls[idx] = tb5
-    mt_both = mt
-    for tb_sex in tb_sex_ls:
-        mt_both = mt_both.anti_join_cols(tb_sex)
-    mt_f = mt.filter_cols(mt.isFemale).anti_join_cols(tb_sex_ls[sexes.index('f')]) if 'f' in sexes else None
-    mt_m = mt.filter_cols(~mt.isFemale).anti_join_cols(tb_sex_ls[sexes.index('m')]) if 'm' in sexes else None
+        tb_sex_path = wd+f'{phen}.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.ht'
+        try:
+            subprocess.check_output([f'gsutil', 'ls', tb_sex_path+'/_SUCCESS']) is not None
+            print(f'\n... {phen} table for {sex} already written! ...\n')
+        except:
+            print(f'\n... Starting to write {phen} table for {sex} ...\n')
+            filter_arg = mt_cols.isFemale if sex=='f' else (~mt_cols.isFemale if sex=='m' else None)
+            mt_cols_sex = mt_cols.filter(filter_arg) 
+            n_sex = mt_cols_sex.count()
+            print(f'\n\n... Initial {sex} mt count ({phen}): {n_sex} ...\n')
+            tb1 = mt_cols_sex.add_index('idx_tmp')
+            tb2 = tb1.key_by('idx_tmp')
+            remove = [1]*(n_remove_per_sex)+[0]*(n_sex-n_remove_per_sex)
+            randstate = np.random.RandomState(int(seed)) 
+            randstate.shuffle(remove)
+            tb3 = tb2.annotate(remove = hl.literal(remove)[hl.int32(tb2.idx_tmp)])
+            tb4 = tb3.filter(tb3.remove == 1, keep=True) #keep samples we wish to discard from original mt
+    #         tb4 = tb3.filter(tb3.remove == 1, keep=False) #remove samples we wish to discard from original mt
+            tb5 = tb4.key_by('s')
+            tb5.select('phen').write(tb_sex_path) # write out table with samples of single sex we wish to discard from original mt
+        tb_sex_ls[idx] = hl.read_table(tb_sex_path)
+    if len(set(sexes).union('fm')) == 2: #if sexes has both sexes
+        tb_both_path = wd+f'{phen}.both_sexes.n_remove_{n_remove_per_sex}.seed_{seed}.ht'
+        try:
+            subprocess.check_output([f'gsutil', 'ls', tb_both_path+'/_SUCCESS']) is not None
+            print(f'\n... {phen} table for both_sexes already written! ...\n')
+        except:
+            print(f'\n... Starting to write {phen} table for both_sexes ...\n')
+            tb_both = mt_cols
+            tb_both = tb_both.anti_join(tb_sex_ls[0])
+            tb_both = tb_both.anti_join(tb_sex_ls[1])
+            tb_both = mt_cols.anti_join(tb_both)
+            tb_both.select('phen').write(tb_both_path) # write out table containing all m/f individuals we wish to discard from original mt
+        tb_both = hl.read_table(tb_both_path)
+        mt_both = mt.anti_join_cols(tb_both)
+        mt_both_ct = mt_both.count_cols()
+        print(f'\n\n... Final both_sexes mt count ({phen}): {mt_both_ct} ...\n')
+    else: 
+        mt_both=None
+    mt_f = mt.filter_cols(mt.isFemale) if 'f' in sexes else None
+    mt_f = mt_f.anti_join_cols(tb_sex_ls[sexes.index('f')]) if mt_f is not None else None
+    mt_m = mt.filter_cols(~mt.isFemale) if 'm' in sexes else None
+    mt_m = mt_m.anti_join_cols(tb_sex_ls[sexes.index('m')]) if mt_m is not None else None
     mt_sex_ls = [mt_f, mt_m]
-    mt_both_ct = mt_both.count_cols()
-    print(f'\n\n... Final combined mt count ({phen}): {mt_both_ct} ...\n')
     for idx, sex in enumerate('fm'):
         if sex in sexes:
             mt_sex_ct = mt_sex_ls[idx].count_cols()
-            print(f'\n... Final {sex} mt count ({phen}): {mt_sex_ct} ...\n')
+            print(f'\n\n... Final {sex} mt count ({phen}): {mt_sex_ct} ...\n')
+
     return mt_both, mt_f, mt_m, seed
     
 def gwas(mt, x, y, cov_list=[], with_intercept=True, pass_through=[], path_to_save=None, 
@@ -105,7 +122,7 @@ def gwas(mt, x, y, cov_list=[], with_intercept=True, pass_through=[], path_to_sa
     mt = mt._annotate_all(col_exprs={'__y':y},
                            entry_exprs={'__x':x})
     
-    print('... Calculating allele frequency ...')
+    print('\n... Calculating allele frequency ...')
     mt_freq_rows = mt.annotate_rows(freq = hl.agg.mean(mt.dosage)/2).rows() #frequency of alternate allele
     mt_freq_rows = mt_freq_rows.key_by('rsid')
     
@@ -218,110 +235,285 @@ def get_freq_alt(mt, sex, n_remove, seed):
     ss = ss.key_by('snpid')
     
     ss.export(wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.tsv.bgz')
+    
         
-def prs(mt, phen, sex, n_remove, prune, threshold, seed):
+        
+def prs(mt_all, phen, sex, n_remove, prune, percentiles, seed):
     r'''
     Calculate PRS using betas from both sexes and sex-stratified GWAS, as well
     as MTAG meta-analyzed betas.
+    P-value thresholds are determined by percentile
     '''
     assert sex in ['both_sexes','female','male'], f'WARNING: sex={sex} not allowed. sex must be one of the following: both_sexes, female, male'
-    threshold_str = '{:.4e}'.format(threshold)
-    corr_path = (wd+f'corr.{phen}.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.\
-                 {"" if prune else "not_"}pruned.threshold_{threshold_str}.tsv')
-    try:
-        subprocess.check_output([f'gsutil', 'ls', corr_path]) != None
-    except:
+
+        
+#    mt = get_test_mt(mt_all, sex=('fe' if sex=='male' else '')+'male', seed=seed)
+#    mt = get_test_mt(mt_all, sex=sex, seed=seed)
+    mt = get_test_mt(mt_all, sex='both_sexes', seed=seed)
+    
+    # "def" uses the MTAG results created by using the default settings
+    # "rg1" uses the MTAG results created by using the --perfect-gencov flag
+    gwas_versions = ['unadjusted',f'mtag_{"rg1" if sex is "both_sexes" else "def"}'] 
+    
+#        r_ls, rpval_ls, gwas_version_ls, percentile_ls, threshold_ls, snps_ls = [], [], [], [], [], []
+    
+    for gwas_version in gwas_versions:
+        print(f'\n... Calculating PRS for "{phen_dict[phen][0]}" {sex} {gwas_version} ...\n')
+        gwas_version_suffix = "" if gwas_version=='unadjusted' else '.'+gwas_version
+        gwas_path = (wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}{gwas_version_suffix}.tsv.{"b" if gwas_version=="unadjusted" else ""}gz')
+
+        ss=hl.import_table(gwas_path,
+                           impute=True,
+                           key='snpid' if gwas_version is 'unadjusted' else 'SNP',
+                           force=True)
+        
         if prune:
-            print('\n... Pruning SNPs ...')
+            print('\n... Pruning SNPs ...\n')
             # define the set of SNPs
-            pruned_snps_file = 'gs://nbaya/risk_gradients/ukb_imp_v3_pruned.bim' #from Robert Maier (pruning threshold=0.2, random 10k sample)
+            pruned_snps_file = 'gs://nbaya/risk_gradients/ukb_imp_v3_pruned.bim' #from Robert Maier (pruning threshold=0.2, random 10k UKB sample)
             variants = hl.import_table(pruned_snps_file, delimiter='\t', no_header=True, impute=True)
-            print(f'\n... Pruning to variants in {pruned_snps_file}...')
+            print(f'\n... Pruning to variants in {pruned_snps_file} ...\n')
             variants = variants.rename(
                 {'f0': 'chr', 'f1': 'rsid', 'f3': 'pos'}).key_by('rsid')
-            mt = mt.key_rows_by('rsid')
+#            mt = mt.key_rows_by('rsid')
             # filter to variants defined in variants table
-            mt = mt.filter_rows(hl.is_defined(variants[mt.rsid]))
-            ct_rows = mt.count_rows()
-            print(f'\n... row count after pruning filter: {ct_rows} ...\n')
+            ss = ss.filter(hl.is_defined(variants[ss['snpid' if gwas_version is 'unadjusted' else 'SNP']]))
+            ct_rows = ss.count()
+            print(f'\n\n... SNP count after pruning filter: {ct_rows} ...\n')
         else:
             print(f'\n... Not pruning because prune={prune} ...\n')
             
-        # "def" uses the MTAG results created by using the default settings
-        # "rg1" uses the MTAG results created by using the --perfect-gencov flag
-        gwas_versions = ['unadjusted',f'mtag_{"rg1" if sex is "both_sexes" else "def"}'] 
         
-        r_ls, gwas_version_ls = [], []
+        for percentile in percentiles:
+
+            prs_path_without_threshold = (wd+f'prs.{phen}.{sex}.n_remove_{int(n_remove_per_sex)}.seed_{seed}.{gwas_version}.{"" if prune else "not_"}pruned.pval_thresh_*.perc_{percentile}.tsv')
+#            prs_path_without_threshold = (wd+f'prs.{phen}.{sex}.n_remove_{int(n_remove_per_sex)}.seed_{seed}.{gwas_version}.{"" if prune else "not_"}pruned.pval_thresh_*.perc_{percentile}.opposite_sex.tsv')
+
+            try:
+                subprocess.check_output(['gsutil', 'ls', prs_path_without_threshold]) != None
+                print(f'\n\n... Calculation of PRS for "{phen_dict[phen][0]}" {sex} {gwas_version} for percentile {percentile} already completed! ...\n')
+        
+            except:
+                start = dt.now()
+                
+                threshold = ss.aggregate(hl.agg.approx_quantiles(ss[('' if gwas_version is 'unadjusted' else 'mtag_')+'pval'],percentile))
+                threshold_str = '{:.4e}'.format(threshold)
+                prs_path = wd+f'prs.{phen}.{sex}.n_remove_{int(n_remove_per_sex)}.seed_{seed}.{gwas_version}.{"" if prune else "not_"}pruned.pval_thresh_{threshold_str}.perc_{percentile}.tsv'
+#                prs_path = wd+f'prs.{phen}.{sex}.n_remove_{int(n_remove_per_sex)}.seed_{seed}.{gwas_version}.{"" if prune else "not_"}pruned.pval_thresh_{threshold_str}.perc_{percentile}.opposite_sex.tsv'
+
+                print(f'\n\n... Using p-value threshold of {threshold} for percentile {percentile} ...\n')
+                
+                ss = ss.filter(ss[('' if gwas_version is 'unadjusted' else 'mtag_')+'pval']<=threshold)
+                                
+                mt = mt.annotate_rows(beta = ss[mt.rsid]['beta' if gwas_version is 'unadjusted' else 'mtag_beta'])
+    
+                threshold_ct = mt.filter_rows(hl.is_defined(mt.beta)).count_rows()
+                
+                print(f'\n\n... Variants remaining after thresholding filter: {threshold_ct} ...\n')
+                
+                mt = mt.annotate_cols(prs = hl.agg.sum(mt.dosage*mt.beta))
+                
+                mt_cols_ct = mt.filter_cols(hl.is_defined(mt.prs)).count_cols()
+                
+                print(f'\n\n... Samples with PRS: {mt_cols_ct} ...\n')
+    
+                mt.cols().select('phen','prs').export(prs_path) #to_pandas()
+                
+                elapsed = dt.now()-start
+                
+                print(f'\n\n... Completed calculation of PRS for "{phen_dict[phen][0]}" {sex} {gwas_version} ...')
+                print(f'\n... Elapsed time: {round(elapsed.seconds/60, 2)} min ...\n')
+
+def get_test_mt(mt_all, sex, seed):
+    assert sex in ['both_sexes','female','male'], f'WARNING: sex={sex} not allowed. sex must be one of the following: both_sexes, female, male'
+    sex_dict = {'both_sexes':'both_sexes','female':'f','male':'m'}
+    path = wd+f'{phen}.{sex_dict[sex]}.n_remove_{int(n_remove_per_sex)}.seed_{seed}.ht'
+    ht_sex = hl.read_table(path)
+    return mt_all.semi_join_cols(ht_sex)
+
+def prs_phen_reg(mt_all, phen, sex, n_remove, prune, percentiles, seed):
+    test_mt = get_test_mt(mt_all, 'both_sexes', seed=phen_dict[phen][1])
+    test_ht = test_mt.cols()
+    
+
+    reg_path = wd+f'prs_phen_reg.{phen}.{sex}.n_remove_{int(n_remove_per_sex)}.seed_{seed}.{"" if prune else "not_"}pruned.tsv'
+
+    
+    try:
+        subprocess.check_output(['gsutil', 'ls', reg_path]) != None
+        print(f'... Phen ~ PRS + covariates regression already complete for all gwas versions & percentiles of {phen} {sex} ! ...')
+    except:
+        
+        row_struct_ls = []
+#        gwas_version_ls = []
+#        percentile_ls = []
+#        pval_thresh_ls = []
+#        test_sex_ls = []
+#        r2_ls = []
+#        r2_pval_ls = []
+        
+        gwas_versions = ['unadjusted', f'mtag_{"def" if sex!="both_sexes" else "rg1"}']
         
         for gwas_version in gwas_versions:
-            print(f'\n... Calculating PRS-phenotype R for "{phen_dict[phen][0]}" {sex} {gwas_version} ...')
-            gwas_version_suffix = "" if gwas_version=='unadjusted' else '.'+gwas_version
-            gwas_path = (wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}{gwas_version_suffix}.tsv.bgz')
+            for percentile in percentiles:
+                prs_path_without_threshold = (wd+f'prs.{phen}.{sex}.n_remove_{int(n_remove_per_sex)}.seed_{seed}.{gwas_version}.{"" if prune else "not_"}pruned*.perc_{percentile}{".comb" if sex!="both_sexes" else ""}.tsv')
+                print(prs_path_without_threshold)
+                process = subprocess.Popen(['gsutil','ls',prs_path_without_threshold], stdout=subprocess.PIPE)
+                stdout, stderr = process.communicate()
+                prs_path = stdout.decode('ascii').splitlines()[0]
+                if sex=='both_sexes':
+                    path_w_thresh = prs_path
+                else:
+                    original_prs_path = wd+f'prs.{phen}.{sex}.n_remove_{int(n_remove_per_sex)}.seed_{seed}.{gwas_version}.{"" if prune else "not_"}pruned.pval*.perc_{percentile}.tsv'
+                    process = subprocess.Popen(['gsutil','ls',original_prs_path], stdout=subprocess.PIPE)
+                    stdout, stderr = process.communicate()
+                    path_w_thresh = stdout.decode('ascii').splitlines()[0]
+                pval_thresh = path_w_thresh.split('pval_thresh_')[1].split('.perc')[0] #previously used for the both_sexes prs
+                print(f'... {phen} {sex} {gwas_version} percentile={percentile} ...')
+                print(f'... using {prs_path} ...')
+                print(f'... pval threshold: {pval_thresh} ...')
+                prs_ht = hl.import_table(prs_path,impute=True, key='s',types={'s': hl.tstr})
+                test_ht = test_ht.annotate(prs = prs_ht[test_ht.s].prs)
+                
+                cov_list = ['prs','age','age_squared']+['PC{:}'.format(i) for i in range(1, 21)]
+                for isFemale in [0,1]:
+                    test_ht_sex = test_ht.filter(test_ht.isFemale==isFemale)
+                    reg = test_ht_sex.aggregate(hl.agg.linreg(y=test_ht_sex.phen, 
+                                                              x=[1]+list(map(lambda x: test_ht_sex[x] if type(x) is str else x,cov_list))))
+                    print(f'\n\n... {phen} {sex} {gwas_version} percentile={percentile} applied to {"fe" if isFemale else ""}males ...\n'+
+                          f'\n... multiple R^2: {reg.multiple_r_squared} ...'+
+                          f'\n... pval for multiple R^2: {reg.multiple_p_value} ...'+
+                          f'\n... adjusted R^2: {reg.adjusted_r_squared} ...')
+                    row_struct_ls.append({'phen':phen, 'gwas_sex':sex, 'gwas_version':gwas_version,
+                                          'percentile':str(percentile), 'pval_threshold':pval_thresh,
+                                          'sex_tested_on':f'{"fe" if isFemale else ""}males',
+                                          'multiple_r2':str(reg.multiple_r_squared),
+                                          'multiple_r2_pval':str(reg.multiple_p_value),
+                                          'adjusted_r2':str(reg.adjusted_r_squared)})
+#                    percentile_ls.append(percentile)
+#                    pval_thresh_ls.append(pval_thresh)
+#                    r2_ls.append(reg.multiple_r_squared)
+#                    r2_pval_ls.append(reg.multiple_p_value)
+                
+#        df = pd.DataFrame(data=list(zip([phen]*len(r2_ls), [sex]*len(r2_ls), 
+#                                gwas_version_ls, percentile_ls, pval_thresh_ls, 
+#                                test_sex_ls,r2_ls, r2_pval_ls)),
+#                      columns=['phen', 'gwas_sex', 'gwas_version','percentile',
+#                               'pval_threshold', 'sex_tested_on','r2','r2_pval']) 
+#        print(df)
+        ht = hl.Table.parallelize(hl.literal(row_struct_ls, 'array<struct{phen: str, gwas_sex: str, gwas_version: str, percentile: str, pval_threshold: str, sex_tested_on: str, multiple_r2: str, multiple_r2_pval: str, adjusted_r2: str}>'))
+        ht = ht.annotate(percentile = hl.float(ht.percentile),
+                         pval_threshold = hl.float(ht.pval_threshold),
+                         multiple_r2 = hl.float(ht.multiple_r2),
+                         multiple_r2_pval = hl.float(ht.multiple_r2_pval),
+                         adjusted_r2 = hl.float(ht.adjusted_r2))
+        ht.show(12)
+#        hl.Table.parallelize(hl.literal(row_ls))
     
-            ss=hl.import_table(gwas_path,impute=True,key='snpid' if gwas_version is 'unadjusted' else 'SNP')
-            
-            ss = ss.filter(ss.pval<threshold)
-            
-            mt = mt.annotate(beta = ss[mt.rsid]['beta' if gwas_version is 'unadjusted' else 'mtag_beta'])
-            
-            mt = mt.aggregate_cols(prs = hl.agg.sum(mt.dosage*mt.beta))
-            
-            mt_cols = mt.cols()
-            
-            r = mt_cols.aggregate(hl.agg.corr(mt_cols.phen, mt_cols.prs))
-            print(f'\n\n... PRS-phenotype R for "{phen_dict[phen][0]}" {sex} {gwas_version}\
-                                                  GWAS ({"" if prune else "not_"}pruned,\
-                                                  pval<{threshold_str}) ...\nR = {r}\
-                                                  \nR^2 = {r**2}\n\n')
-            r_ls.append(r)
-            gwas_version_ls.append(gwas_version)
-            
-        df = pd.DataFrame(data=list(zip([phen]*len(r_ls), [sex]*len(r_ls), gwas_version_ls, r_ls)),
-                              columns=['phen', 'sex', 'gwas_version', 'r'])
-        print(df)
-    
-        hl.Table.from_pandas(df).export(corr_path)
+#        hl.Table.from_pandas(df).export(reg_path)  
+        ht.export(reg_path)  
+
+def prs_corr(phen,sex,n_remove,prune,percentiles,seed):
+    pass
+#    for 
+#    threshold_str = '{:.4e}'.format(threshold)
+#    corr_path = (wd+f'corr.{phen}.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.{"" if prune else "not_"}pruned.threshold_{threshold_str}.tsv')
+#    corr_path = (wd+f'corr.{phen}.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.{"" if prune else "not_"}pruned.tsv')
+                
+    #            mt_cols.select('phen','prs').export()
+                
+#                r, rpval = stats.pearsonr(df_cols.phen, df_cols.prs)
+#                print(f'\n\n... PRS-phenotype R for "{phen_dict[phen][0]}" {sex} {gwas_version} GWAS ({"" if prune else "not_"}pruned, pval≤{threshold}) ...\nR: {r}\nR^2: {r**2}\npval: {rpval}\n\n')
+#                gwas_version_ls.append(gwas_version)
+#                r_ls.append(r)
+#                rpval_ls.append(rpval)
+#                percentile_ls.append(percentiles[threshold_idx])
+#                threshold_ls.append(threshold)
+#                snps_ls.append(threshold_ct)
+#            
+#        df = pd.DataFrame(data=list(zip([phen]*len(r_ls), [sex]*len(r_ls), 
+#                                        gwas_version_ls, [prune]*len(r_ls),
+#                                        percentile_ls, threshold_ls, snps_ls, 
+#                                        r_ls, rpval_ls)),
+#                              columns=['phen', 'sex', 'gwas_version','pruned',
+#                                       'percentile','pval_threshold','n_snps', 
+#                                       'r','r_pval'])
+#        print(df)
+#    
+#        hl.Table.from_pandas(df).export(corr_path)
+        
+
 
 
 
 if __name__ == "__main__":
     phen_dict = {
-                '50_irnt':['Standing height', 73178],
-                '23105_irnt':['Basal metabolic rate', 35705],
-#                '23106_irnt':['Impedance of the whole body', 73701],
+#                        '50_irnt':['Standing height', 73178],
+#                        '23105_irnt':['Basal metabolic rate', 35705],
+#                        '23106_irnt':['Impedance of the whole body', 73701],
 #                '2217_irnt':['Age started wearing contact lenses or glasses', 73178],
-            '23127_irnt':['Trunk fat percentage', 73178]
-#                '1100':['Drive faster than motorway speed limit', 73178],
-#                '1757':['Facial ageing', 35705],
-#            '6159_3':['Pain type(s) experienced in last month: Neck or shoulder',None],
-#            '894':['Duration of moderate activity',None],
-#            '1598':['Average weekly spirits intake',None]
+                        '23127_irnt':['Trunk fat percentage', 73178],
+                '1100':['Drive faster than motorway speed limit', 73178],
+                '1757':['Facial ageing', 35705],
+#                        '6159_3':['Pain type(s) experienced in last month: Neck or shoulder',73178],
+#                '894':['Duration of moderate activity',73178],
+#                '1598':['Average weekly spirits intake',35705]
             }
     
+    variant_set = 'hm3'
     n_remove_per_sex = 10e3
+    prune=True
+    percentiles = [1,0.50,0.10]
+    
+    mt0 = hl.read_matrix_table(f'gs://nbaya/split/ukb31063.{variant_set}_variants.gwas_samples_repart.mt')
+    #Remove withdrawn samples
+    withdrawn = hl.import_table('gs://nbaya/w31063_20181016.csv',missing='',no_header=True)
+    withdrawn_set = set(withdrawn.f0.take(withdrawn.count()))
+    mt0 = mt0.filter_cols(hl.literal(withdrawn_set).contains(mt0['s']),keep=False)
+    mt0 = mt0.key_cols_by('s')
+    
+    phen_tb0 = hl.import_table('gs://ukb31063/ukb31063.PHESANT_January_2019.both_sexes.tsv.bgz',
+                           missing='',impute=True,types={'s': hl.tstr}, key='s')    
     
     for phen, phen_desc in phen_dict.items():
 
-        mt = get_mt(phen)
-        mt_both, mt_f, mt_m, seed = remove_n_individuals(mt=mt, n_remove_per_sex=n_remove_per_sex, 
-                                                         phen=phen,sexes = 'fm', seed=phen_dict[phen][1])
-        for mt_tmp, sex in [(mt_f,'female'), (mt_m,'male'), (mt_both,'both_sexes')]:            
-            path = wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.tsv.bgz'
-            try:
-                subprocess.check_output([f'gsutil', 'ls', path]) != None
-                print(f'\n... "{phen_dict[phen][0]}" GWAS of {sex} already complete! ...\n')
-                prs(mt=mt_tmp,phen=phen,sex=sex,n_remove=n_remove_per_sex,prune=True,threshold=1,seed=seed)
-            except:
-                old_path = wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.old.tsv.bgz'
-                try:
-                    subprocess.check_output([f'gsutil', 'ls', old_path]) != None
-                    print(f'\n... "{phen_dict[phen][0]}" GWAS of {sex} already complete but needs more fields! ...\n')
-                    get_freq(mt=mt_tmp, sex=sex, n_remove=n_remove_per_sex, seed=seed)
-                except:
-                    print(f'\n... Running {sex} GWAS on "{phen_dict[phen][0]}" (code: {phen}) ...\n')
-                    gwas(mt=mt_tmp, 
-                         x=mt_tmp.dosage, 
-                         y=mt_tmp['phen'], 
-                         path_to_save=path,
-                         is_std_cov_list=True)
+        mt = get_mt(mt0=mt0, phen_tb0=phen_tb0, phen=phen)
+#        mt_both, mt_f, mt_m, seed = remove_n_individuals(mt=mt, n_remove_per_sex=n_remove_per_sex, 
+#                                                         phen=phen,sexes = 'fm', seed=phen_dict[phen][1])
+#        for mt_tmp, sex in [(mt_f,'female'), (mt_m,'male'), (mt_both,'both_sexes')]:            
+#            gwas_path = wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.tsv.bgz'
+#            try:
+#                subprocess.check_output([f'gsutil', 'ls', gwas_path ]) != None
+#            except:
+#                old_path = wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.old.tsv.bgz'
+#                try:
+#                    subprocess.check_output([f'gsutil', 'ls', old_path]) != None
+#                except:
+#                    print(f'\n... Running {sex} GWAS on "{phen_dict[phen][0]}" (code: {phen}) ...\n')
+#                    gwas(mt=mt_tmp, 
+#                         x=mt_tmp.dosage, 
+#                         y=mt_tmp['phen'], 
+#                         path_to_save=gwas_path ,
+#                         is_std_cov_list=True)                    
+#                print(f'\n... "{phen_dict[phen][0]}" GWAS of {sex} already complete but needs more fields! ...\n')
+#                get_freq(mt=mt_tmp, sex=sex, n_remove=n_remove_per_sex, seed=seed)
+#                
+#            print(f'\n... "{phen_dict[phen][0]}" GWAS of {sex} already complete! ...\n')
 #            
+#
+
+#        for sex in ['both_sexes']:
+#            prs(mt_all=mt, phen=phen,sex=sex,n_remove=n_remove_per_sex,
+#                prune=prune,percentiles=percentiles,seed=phen_dict[phen][1])
+            
+
+        for sex in ['both_sexes','male','female']:
+            prs_phen_reg(mt_all=mt, phen=phen, sex=sex, n_remove=n_remove_per_sex, 
+                         prune=prune, percentiles=percentiles, seed=phen_dict[phen][1])
+
+
+#            prs_corr(phen=phen,sex=sex,n_remove=n_remove_per_sex,prune=prune,percentiles=percentiles,seed=seed)
+
+#else:
+#    ht = hl.Table.parallelize(hl.struct(phen = ['50_irnt']*2,
+#                                        val = [0]*2))
