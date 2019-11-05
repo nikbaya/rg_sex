@@ -452,12 +452,17 @@ if __name__ == "__main__":
 #                        '23105_irnt':['Basal metabolic rate', 35705],
 #                        '23106_irnt':['Impedance of the whole body', 73701],
 #                '2217_irnt':['Age started wearing contact lenses or glasses', 73178],
-                        '23127_irnt':['Trunk fat percentage', 73178],
-                '1100':['Drive faster than motorway speed limit', 73178],
-                '1757':['Facial ageing', 35705],
+#                        '23127_irnt':['Trunk fat percentage', 73178],
+#                '1100':['Drive faster than motorway speed limit', 73178],
+#                '1757':['Facial ageing', 35705],
 #                        '6159_3':['Pain type(s) experienced in last month: Neck or shoulder',73178],
 #                '894':['Duration of moderate activity',73178],
-#                '1598':['Average weekly spirits intake',35705]
+#                '1598':['Average weekly spirits intake',35705],
+                '50_raw':['Standing height (raw)', None],
+                '23105_raw':['Basal metabolic rate', None],
+                '23106_raw':['Impedance of the whole body', None],
+                '2217_raw':['Age started wearing contact lenses or glasses', None],
+                '23127_raw':['Trunk fat percentage', None],
             }
     
     variant_set = 'hm3'
@@ -466,6 +471,9 @@ if __name__ == "__main__":
     percentiles = [1,0.50,0.10]
     
     mt0 = hl.read_matrix_table(f'gs://nbaya/split/ukb31063.{variant_set}_variants.gwas_samples_repart.mt')
+    
+#    
+    
     #Remove withdrawn samples
     withdrawn = hl.import_table('gs://nbaya/w31063_20181016.csv',missing='',no_header=True)
     withdrawn_set = set(withdrawn.f0.take(withdrawn.count()))
@@ -474,10 +482,10 @@ if __name__ == "__main__":
     
     phen_tb0 = hl.import_table('gs://ukb31063/ukb31063.PHESANT_January_2019.both_sexes.tsv.bgz',
                            missing='',impute=True,types={'s': hl.tstr}, key='s')    
-    
-    for phen, phen_desc in phen_dict.items():
-
-        mt = get_mt(mt0=mt0, phen_tb0=phen_tb0, phen=phen)
+#    
+#    for phen, phen_desc in phen_dict.items():
+#
+#        mt = get_mt(mt0=mt0, phen_tb0=phen_tb0, phen=phen)
 #        mt_both, mt_f, mt_m, seed = remove_n_individuals(mt=mt, n_remove_per_sex=n_remove_per_sex, 
 #                                                         phen=phen,sexes = 'fm', seed=phen_dict[phen][1])
 #        for mt_tmp, sex in [(mt_f,'female'), (mt_m,'male'), (mt_both,'both_sexes')]:            
@@ -507,9 +515,9 @@ if __name__ == "__main__":
 #                prune=prune,percentiles=percentiles,seed=phen_dict[phen][1])
             
 
-        for sex in ['both_sexes','male','female']:
-            prs_phen_reg(mt_all=mt, phen=phen, sex=sex, n_remove=n_remove_per_sex, 
-                         prune=prune, percentiles=percentiles, seed=phen_dict[phen][1])
+#        for sex in ['both_sexes','male','female']:
+#            prs_phen_reg(mt_all=mt, phen=phen, sex=sex, n_remove=n_remove_per_sex, 
+#                         prune=prune, percentiles=percentiles, seed=phen_dict[phen][1])
 
 
 #            prs_corr(phen=phen,sex=sex,n_remove=n_remove_per_sex,prune=prune,percentiles=percentiles,seed=seed)
