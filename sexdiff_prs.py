@@ -33,20 +33,6 @@ hl.init(log='/tmp/hail.log')
 
 wd= 'gs://nbaya/sexdiff/prs/'
 
-def get_mt(mt0, phen_tb0, phen):
-    print(f'\n... Reading UKB phenotype "{phen_dict[phen][0]}" (code: {phen}) ...')
-
-    phen_tb = phen_tb0.select(phen).rename({phen:'phen'})
-
-    mt1 = mt0.annotate_cols(phen_str = hl.str(phen_tb[mt0.s]['phen']).replace('\"',''))
-    mt1 = mt1.filter_cols(mt1.phen_str == '',keep=False)
-
-    if phen_tb.phen.dtype == hl.dtype('bool'):
-        mt1 = mt1.annotate_cols(phen = hl.bool(mt1.phen_str)).drop('phen_str')
-    else:
-        mt1 = mt1.annotate_cols(phen = hl.float64(mt1.phen_str)).drop('phen_str')
-    
-    return mt1
 
 def remove_n_individuals(mt, n_remove_per_sex, phen, sexes = 'fm', seed=None):
     r'''
@@ -60,8 +46,8 @@ def remove_n_individuals(mt, n_remove_per_sex, phen, sexes = 'fm', seed=None):
     seed = seed if seed is not None else int(str(Env.next_seed())[:5])
     print(f'\n... seed: {seed} ...\n')
     mt_cols = mt.cols()
-    initial_ct = mt_cols.count()
-    print(f'\n\n... Initial combined mt count ({phen}): {initial_ct} ...\n')
+#    initial_ct = mt_cols.count()
+#    print(f'\n\n... Initial combined mt count ({phen}): {initial_ct} ...\n')
     tb_sex_ls = [None, None]
     for idx, sex in enumerate(sexes):
         tb_sex_path = wd+f'{phen}.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.ht'
@@ -70,8 +56,7 @@ def remove_n_individuals(mt, n_remove_per_sex, phen, sexes = 'fm', seed=None):
             print(f'\n... {phen} table for {sex} already written! ...\n')
         except:
             print(f'\n... Starting to write {phen} table for {sex} ...\n')
-            filter_arg = mt_cols.isFemale if sex=='f' else (~mt_cols.isFemale if sex=='m' else None)
-            mt_cols_sex = mt_cols.filter(filter_arg) 
+            mt_cols_sex = annotate_phen(ht=mt_cols, phen=phen, sex=sex)
             n_sex = mt_cols_sex.count()
             print(f'\n\n... Initial {sex} mt count ({phen}): {n_sex} ...\n')
             tb1 = mt_cols_sex.add_index('idx_tmp')
@@ -81,7 +66,6 @@ def remove_n_individuals(mt, n_remove_per_sex, phen, sexes = 'fm', seed=None):
             randstate.shuffle(remove)
             tb3 = tb2.annotate(remove = hl.literal(remove)[hl.int32(tb2.idx_tmp)])
             tb4 = tb3.filter(tb3.remove == 1, keep=True) #keep samples we wish to discard from original mt
-    #         tb4 = tb3.filter(tb3.remove == 1, keep=False) #remove samples we wish to discard from original mt
             tb5 = tb4.key_by('s')
             tb5.select('phen').write(tb_sex_path) # write out table with samples of single sex we wish to discard from original mt
         tb_sex_ls[idx] = hl.read_table(tb_sex_path)
@@ -115,6 +99,30 @@ def remove_n_individuals(mt, n_remove_per_sex, phen, sexes = 'fm', seed=None):
 
     return mt_both, mt_f, mt_m, seed
     
+def annotate_phen(ht, phen, sex):
+    r'''
+    Annotates `ht` with phenotype `phen`. Uses sex-specific IRNT phenotypes.
+    sex options: f, m, b (female, male, both sexes)
+    '''
+    print(f'\n... Reading UKB phenotype "{phen_dict[phen][0]}" (code: {phen}) ...')
+    
+    sex_dict = {'f':'female','m':'male','b':'both_sexes'}
+    
+    phen_tb0 = hl.import_table(f'gs://ukb31063/ukb31063.PHESANT_January_2019.{sex_dict[sex]}.tsv.bgz',
+                           missing='',impute=True,types={'s': hl.tstr}, key='s')
+    phen_tb = phen_tb0.select(phen).rename({phen:'phen'})
+
+    ht0 = ht.annotate(phen_str = hl.str(phen_tb[ht.s]['phen']).replace('\"',''))
+    ht1 = ht0.filter(ht0.phen_str == '',keep=False)
+
+    if phen_tb.phen.dtype == hl.dtype('bool'):
+        ht2 = ht1.annotate_cols(phen = hl.bool(ht1.phen_str)).drop('phen_str')
+    else:
+        ht2 = ht1.annotate_cols(phen = hl.float64(ht1.phen_str)).drop('phen_str')
+    
+    return ht2
+
+
 def gwas(mt, x, y, cov_list=[], with_intercept=True, pass_through=[], path_to_save=None, 
          normalize_x=False, is_std_cov_list=False):
     r'''Runs GWAS'''
@@ -480,14 +488,13 @@ if __name__ == "__main__":
     mt0 = mt0.filter_cols(hl.literal(withdrawn_set).contains(mt0['s']),keep=False)
     mt0 = mt0.key_cols_by('s')
     
-    phen_tb0 = hl.import_table('gs://ukb31063/ukb31063.PHESANT_January_2019.both_sexes.tsv.bgz',
-                           missing='',impute=True,types={'s': hl.tstr}, key='s')    
+
 #    
-#    for phen, phen_desc in phen_dict.items():
+    for phen, phen_desc in phen_dict.items():
 #
 #        mt = get_mt(mt0=mt0, phen_tb0=phen_tb0, phen=phen)
-#        mt_both, mt_f, mt_m, seed = remove_n_individuals(mt=mt, n_remove_per_sex=n_remove_per_sex, 
-#                                                         phen=phen,sexes = 'fm', seed=phen_dict[phen][1])
+        mt_both, mt_f, mt_m, seed = remove_n_individuals(mt=mt0, n_remove_per_sex=n_remove_per_sex, 
+                                                         phen=phen,sexes = 'fm', seed=phen_dict[phen][1])
 #        for mt_tmp, sex in [(mt_f,'female'), (mt_m,'male'), (mt_both,'both_sexes')]:            
 #            gwas_path = wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.tsv.bgz'
 #            try:
